@@ -79,7 +79,13 @@ jobs:
           exit 1
         fi
 
-        echo "Deploying image: ${IMAGE:-<missing IMAGE var>} to ${VM_IP} as ${VM_USER}"
+        # IMAGE should be available via GITHUB_ENV from previous step
+        if [ -z "${IMAGE:-}" ]; then
+          echo "ERROR: IMAGE variable is missing. Check Build Docker image step." >&2
+          exit 1
+        fi
+
+        echo "Deploying image: ${IMAGE} to ${VM_IP} as ${VM_USER}"
         echo "deploy_key size (bytes): $(wc -c < ./deploy_key)"
 
         # get short-lived access token on the runner (local)
@@ -89,32 +95,31 @@ jobs:
           exit 1
         fi
 
-        # add known host
+        # add known host locally (so ssh won't prompt)
         mkdir -p ~/.ssh; chmod 700 ~/.ssh
         ssh-keyscan -T 10 "${VM_IP}" 2>/dev/null | tee -a ~/.ssh/known_hosts >/dev/null || true
+        chmod 644 ~/.ssh/known_hosts || true
 
-        # pass the token *expanded* into the remote shell (note: NOT single-quoted heredoc)
+        # Pass the token (expanded here) into the remote session and execute login + pull there.
+        # We intentionally expand ACCESS_TOKEN here so the remote gets the actual token.
         ssh -o StrictHostKeyChecking=no -i ./deploy_key "${VM_USER}@${VM_IP}" /bin/bash -s <<EOF
 set -euo pipefail
 
-# on VM: receive token from runner via interpolated string
 ACCESS_TOKEN_FROM_RUNNER='${ACCESS_TOKEN}'
-
 REGION='${{ secrets.GCP_REGION }}'
 IMAGE='${IMAGE}'
 
-# try docker login using the token
+# Attempt docker login using the provided token
 printf '%s' "\${ACCESS_TOKEN_FROM_RUNNER}" | docker login -u oauth2accesstoken --password-stdin "https://\${REGION}-docker.pkg.dev" || {
   echo "DOCKER LOGIN FAILED" >&2
-  # print non-sensitive diagnostics
-  echo "Contents of /root/.docker/config.json:" >&2
-  sudo cat /root/.docker/config.json 2>/dev/null || true
-  echo "Contents of /home/${VM_USER}/.docker/config.json:" >&2
-  cat /home/${VM_USER}/.docker/config.json 2>/dev/null || true
+  echo "Non-sensitive diagnostics:" >&2
+  echo " - docker version: \$(docker --version 2>/dev/null || true)" >&2
+  echo " - whoami: \$(whoami 2>/dev/null || true)" >&2
+  echo " - ls ~/.docker: \$(ls -la ~/.docker 2>/dev/null || true)" >&2
   exit 2
 }
 
-# pull & restart
+# Pull and run the image
 docker pull "\${IMAGE}"
 docker rm -f python-backend || true
 docker run -d --name python-backend -p 8000:8000 --restart unless-stopped "\${IMAGE}"
