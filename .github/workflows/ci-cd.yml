@@ -17,12 +17,19 @@ jobs:
       uses: actions/checkout@v4
 
     - name: Authenticate to Google Cloud (Workload Identity)
-      uses: google-github-actions/auth@v1
+      uses: google-github-actions/auth@v3
       with:
-        # GitHub secret containing the full provider resource path
+        # GitHub secret containing the full provider resource path:
+        # projects/260643119019/locations/global/workloadIdentityPools/gha-pool-1763714946/providers/gha-prov-1763715055
         workload_identity_provider: "${{ secrets.WIF_PROVIDER_FULL }}"
         # GitHub secret containing the service account email (no JSON key)
         service_account: "${{ secrets.GCP_SA_EMAIL }}"
+        # Create a credentials file so `gcloud` can use stable credentials
+        create_credentials_file: true
+        # Export common environment variables (CLOUDSDK_PROJECT, etc.)
+        export_environment_variables: true
+        # Explicitly set the project id to avoid gcloud trying to refresh tokens itself
+        project_id: ${{ secrets.GCP_PROJECT_ID }}
 
     - name: Setup gcloud CLI
       uses: google-github-actions/setup-gcloud@v3
@@ -35,13 +42,12 @@ jobs:
       uses: google-github-actions/get-secretmanager-secrets@v0
       with:
         # Format: <SECRET_NAME_IN_GCP_SECRET_MANAGER>:<OUTPUT_ENV_VAR_NAME>
-        # This reads the secret value from GCP Secret Manager and puts it in steps.get-ssh.outputs.SSH_KEY
         secrets: |
           github-actions-ssh-key:SSH_KEY
 
     - name: Write SSH key to file
       run: |
-        # The secret should be base64-encoded; decode and write to file
+        # The secret should be base64-encoded in Secret Manager; decode and write to file
         echo "${{ steps.get-ssh.outputs.SSH_KEY }}" | base64 --decode > ./deploy_key
         chmod 600 ./deploy_key
 
@@ -54,6 +60,7 @@ jobs:
       run: |
         IMAGE="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${ARTIFACT_REPO}/${IMAGE_NAME}:${GITHUB_SHA::8}"
         docker build -t "$IMAGE" .
+        # authenticate docker to Artifact Registry using gcloud credentials file created by auth action
         gcloud auth configure-docker "${GCP_REGION}-docker.pkg.dev" --quiet
         docker push "$IMAGE"
         echo "IMAGE=$IMAGE" >> $GITHUB_ENV
