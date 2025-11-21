@@ -9,7 +9,6 @@ permissions:
   id-token: write
   contents: read
 
-# Use secrets only (do not put private keys here)
 env:
   GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
   GCP_PROJECT_NUMBER: ${{ secrets.GCP_PROJECT_NUMBER }}
@@ -20,17 +19,22 @@ env:
   ARTIFACT_REPO: ${{ secrets.ARTIFACT_REPO }}
   IMAGE_NAME: ${{ secrets.IMAGE_NAME }}
   VM_IP: ${{ secrets.VM_EXTERNAL_IP }}
-  VM_USER: ${{ secrets.VM_USER }}   # must be set (e.g. "ubuntu")
+  VM_USER: ${{ secrets.VM_USER }}   # must be set in repo secrets (e.g. "ubuntu")
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: DEBUG: show provider (safe)
         run: |
+          echo "GCP_PROJECT_NUMBER='${{ secrets.GCP_PROJECT_NUMBER }}'"
+          echo "WIF_POOL='${{ secrets.WIF_POOL }}'"
+          echo "WIF_PROVIDER='${{ secrets.WIF_PROVIDER }}'"
+          echo "Resolved provider:"
           echo "projects/${{ secrets.GCP_PROJECT_NUMBER }}/locations/global/workloadIdentityPools/${{ secrets.WIF_POOL }}/providers/${{ secrets.WIF_PROVIDER }}"
           echo "Service account: ${{ secrets.GCP_SA_EMAIL }}"
 
@@ -53,7 +57,7 @@ jobs:
           secrets: |
             github-actions-ssh-key:SSH_KEY
 
-      - name: Write SSH key
+      - name: Write SSH key to file
         run: |
           echo "${{ steps.get-ssh.outputs.SSH_KEY }}" | base64 --decode > ./deploy_key
           chmod 600 ./deploy_key
@@ -70,13 +74,13 @@ jobs:
       - name: Deploy to VM
         run: |
           set -euo pipefail
-          IMAGE="${IMAGE}"
           echo "Deploying ${IMAGE} to ${VM_USER}@${VM_IP}"
           ssh -o StrictHostKeyChecking=no -i ./deploy_key ${VM_USER}@${VM_IP} <<'SSH_CMDS'
-          set -euxo pipefail
-          docker rm -f python-backend || true
-          docker pull "${IMAGE}"
-          docker run -d --name python-backend -p 8000:8000 --restart unless-stopped "${IMAGE}"
+            set -euxo pipefail
+            docker rm -f python-backend || true
+            docker pull "${IMAGE}"
+            docker run -d --name python-backend -p 8000:8000 --restart unless-stopped "${IMAGE}"
+            docker ps --filter "name=python-backend"
           SSH_CMDS
 
       - name: Show logs
