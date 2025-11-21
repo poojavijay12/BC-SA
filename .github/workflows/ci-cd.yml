@@ -103,24 +103,24 @@ jobs:
         # Pass the token (expanded here) into the remote session and execute login + pull there.
         # We intentionally expand ACCESS_TOKEN here so the remote gets the actual token.
         ssh -o StrictHostKeyChecking=no -i ./deploy_key "${VM_USER}@${VM_IP}" /bin/bash -s <<EOF
-set -euo pipefail
+        set -euo pipefail
 
-ACCESS_TOKEN_FROM_RUNNER='${ACCESS_TOKEN}'
-REGION='${{ secrets.GCP_REGION }}'
-IMAGE='${IMAGE}'
+        ACCESS_TOKEN_FROM_RUNNER='${ACCESS_TOKEN}'
+        REGION='${{ secrets.GCP_REGION }}'
+        IMAGE='${IMAGE}'
 
-# Attempt docker login using the provided token
-printf '%s' "\${ACCESS_TOKEN_FROM_RUNNER}" | docker login -u oauth2accesstoken --password-stdin "https://\${REGION}-docker.pkg.dev" || {
-  echo "DOCKER LOGIN FAILED" >&2
-  echo "Non-sensitive diagnostics:" >&2
-  echo " - docker version: \$(docker --version 2>/dev/null || true)" >&2
-  echo " - whoami: \$(whoami 2>/dev/null || true)" >&2
-  echo " - ls ~/.docker: \$(ls -la ~/.docker 2>/dev/null || true)" >&2
-  exit 2
-}
+        # Attempt docker login using the provided token
+        printf '%s' "\${ACCESS_TOKEN_FROM_RUNNER}" | docker login -u oauth2accesstoken --password-stdin "https://\${REGION}-docker.pkg.dev" || {
+          echo "DOCKER LOGIN FAILED" >&2
+          echo "Non-sensitive diagnostics:" >&2
+          echo " - docker version: \$(docker --version 2>/dev/null || true)" >&2
+          echo " - whoami: \$(whoami 2>/dev/null || true)" >&2
+          echo " - ls ~/.docker: \$(ls -la ~/.docker 2>/dev/null || true)" >&2
+          exit 2
+        }
 
-# Pull and run the image
-docker pull "\${IMAGE}"
-docker rm -f python-backend || true
-docker run -d --name python-backend -p 8000:8000 --restart unless-stopped "\${IMAGE}"
-EOF
+        # Pull and run the image
+        docker pull "\${IMAGE}"
+        docker rm -f python-backend || true
+        docker run -d --name python-backend -p 8000:8000 --restart unless-stopped "\${IMAGE}"
+        EOF
