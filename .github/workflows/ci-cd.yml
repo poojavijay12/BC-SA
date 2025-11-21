@@ -31,13 +31,18 @@ jobs:
         project_id: ${{ secrets.GCP_PROJECT_ID }}
         version: "latest"
 
-    - name: Fetch SSH key from Secret Manager
+    - name: Fetch SSH key from Secret Manager (via gcloud)
       id: get-ssh
-      uses: google-github-actions/get-secretmanager-secrets@v0
-      with:
-        # Format: <SECRET_NAME_IN_GCP_SECRET_MANAGER>:<OUTPUT_ENV_VAR_NAME>
-        secrets: |
-          github-actions-ssh-key:SSH_KEY
+      run: |
+        # Fetch the latest secret value (it is stored base64-encoded in Secret Manager)
+        gcloud secrets versions access latest --secret="github-actions-ssh-key" --project="${{ secrets.GCP_PROJECT_ID }}" \
+          | tr -d '\r' > ./deploy_key.b64
+
+        # Decode and write the private key file
+        base64 --decode ./deploy_key.b64 > ./deploy_key
+        chmod 600 ./deploy_key
+
+      # ensure gcloud is available and authenticated (auth@v3 created credentials file)
 
     - name: Write SSH key to file
       run: |
