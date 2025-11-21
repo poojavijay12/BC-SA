@@ -6,12 +6,10 @@ on:
     branches:
       - main
 
-# required to allow runner to mint ID token
 permissions:
   id-token: write
   contents: read
 
-# repo-level env from secrets (do not put high-risk secrets here)
 env:
   GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
   GCP_PROJECT_NUMBER: ${{ secrets.GCP_PROJECT_NUMBER }}
@@ -32,10 +30,6 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      ################################################################
-      # DEBUG: print the resolved provider string (SAFE — prints no secrets)
-      # Use this output to ensure provider string uses project NUMBER (not id)
-      ################################################################
       - name: Debug: show resolved WIF provider & SA email (no secrets)
         run: |
           echo "---- DEBUG START ----"
@@ -48,9 +42,6 @@ jobs:
           echo "projects/${{ secrets.GCP_PROJECT_NUMBER }}/locations/global/workloadIdentityPools/${{ secrets.WIF_POOL }}/providers/${{ secrets.WIF_PROVIDER }}"
           echo "---- DEBUG END ----"
 
-      ################################################################
-      # Authenticate to Google Cloud using Workload Identity Federation
-      ################################################################
       - name: Authenticate to Google Cloud (Workload Identity)
         id: auth
         uses: google-github-actions/auth@v1
@@ -64,10 +55,6 @@ jobs:
           project_id: ${{ secrets.GCP_PROJECT_ID }}
           version: "latest"
 
-      ################################################################
-      # Fetch SSH private key from Secret Manager (keep secret out of GitHub)
-      # Secret name in Secret Manager: github-actions-ssh-key
-      ################################################################
       - name: Fetch SSH key from Secret Manager
         id: get-ssh
         uses: google-github-actions/get-secretmanager-secrets@v0
@@ -80,9 +67,6 @@ jobs:
           echo "${{ steps.get-ssh.outputs.SSH_KEY }}" | base64 --decode > ./deploy_key
           chmod 600 ./deploy_key
 
-      ################################################################
-      # Build & push Docker image to Artifact Registry
-      ################################################################
       - name: Build & push Docker image to Artifact Registry
         id: build_push
         env:
@@ -94,14 +78,10 @@ jobs:
           set -euo pipefail
           IMAGE="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${ARTIFACT_REPO}/${IMAGE_NAME}:${GITHUB_SHA::8}"
           echo "IMAGE=${IMAGE}" >> $GITHUB_ENV
-
           docker build -t "${IMAGE}" .
           gcloud auth configure-docker "${GCP_REGION}-docker.pkg.dev" --quiet
           docker push "${IMAGE}"
 
-      ################################################################
-      # Deploy to VM via SSH (inline commands; no external .sh file)
-      ################################################################
       - name: Deploy to VM (pull image & restart container)
         env:
           VM_IP: ${{ env.VM_IP }}
@@ -112,7 +92,6 @@ jobs:
           echo "Deploying image: $IMAGE to $VM_IP (user: $VM_USER)"
           sleep 2
 
-          # run remote commands via ssh; IMAGE is expanded on runner side and passed in
           ssh -o StrictHostKeyChecking=no -i ./deploy_key ${VM_USER}@${VM_IP} <<'SSH_CMDS'
           set -euxo pipefail
 
@@ -121,22 +100,12 @@ jobs:
             exit 1
           fi
 
-          # remove old container if exists
           docker rm -f python-backend || true
-
-          # pull & run the new image (IMAGE variable will be substituted by client)
           docker pull "${IMAGE}"
-          docker run -d --name python-backend \
-            -p 8000:8000 \
-            --restart unless-stopped \
-            "${IMAGE}"
-
+          docker run -d --name python-backend -p 8000:8000 --restart unless-stopped "${IMAGE}"
           docker ps --filter "name=python-backend"
           SSH_CMDS
 
-      ################################################################
-      # Final check: show container logs (optional)
-      ################################################################
       - name: Show remote container logs
         run: |
           ssh -o StrictHostKeyChecking=no -i ./deploy_key ${VM_USER}@${VM_IP} "docker logs --tail 50 python-backend || true"
