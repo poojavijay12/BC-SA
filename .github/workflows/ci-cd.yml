@@ -66,40 +66,56 @@ jobs:
         docker push "$IMAGE"
         echo "IMAGE=$IMAGE" >> $GITHUB_ENV
 
-    - name: Deploy to VM (login with short-lived token & deploy)
+    - name: Deploy to VM (login with short-lived token & deploy) - FIXED
       env:
         VM_IP: ${{ secrets.VM_EXTERNAL_IP }}
         VM_USER: ${{ secrets.VM_USER }}
         GCP_REGION: ${{ secrets.GCP_REGION }}
       run: |
+        set -euo pipefail
+
         if [ -z "${VM_IP:-}" ] || [ -z "${VM_USER:-}" ]; then
           echo "ERROR: VM_EXTERNAL_IP or VM_USER is empty" >&2
           exit 1
         fi
 
         echo "Deploying image: ${IMAGE:-<missing IMAGE var>} to ${VM_IP} as ${VM_USER}"
+        echo "deploy_key size (bytes): $(wc -c < ./deploy_key)"
 
-        # get short-lived access token on the runner
+        # get short-lived access token on the runner (local)
         ACCESS_TOKEN="$(gcloud auth print-access-token)"
         if [ -z "$ACCESS_TOKEN" ]; then
           echo "ERROR: failed to get access token" >&2
           exit 1
         fi
 
-        # ensure known host present
+        # add known host
         mkdir -p ~/.ssh; chmod 700 ~/.ssh
         ssh-keyscan -T 10 "${VM_IP}" 2>/dev/null | tee -a ~/.ssh/known_hosts >/dev/null || true
 
-        # run docker login on the VM and deploy the image
-        ssh -o StrictHostKeyChecking=no -i ./deploy_key "${VM_USER}@${VM_IP}" /bin/bash -s <<'EOF'
+        # pass the token *expanded* into the remote shell (note: NOT single-quoted heredoc)
+        ssh -o StrictHostKeyChecking=no -i ./deploy_key "${VM_USER}@${VM_IP}" /bin/bash -s <<EOF
 set -euo pipefail
-ACCESS_TOKEN_FROM_RUNNER='$ACCESS_TOKEN'
+
+# on VM: receive token from runner via interpolated string
+ACCESS_TOKEN_FROM_RUNNER='${ACCESS_TOKEN}'
+
 REGION='${{ secrets.GCP_REGION }}'
 IMAGE='${IMAGE}'
-# login to Artifact Registry on the VM using token
-printf '%s' "${ACCESS_TOKEN_FROM_RUNNER}" | docker login -u oauth2accesstoken --password-stdin "https://${REGION}-docker.pkg.dev"
+
+# try docker login using the token
+printf '%s' "\${ACCESS_TOKEN_FROM_RUNNER}" | docker login -u oauth2accesstoken --password-stdin "https://\${REGION}-docker.pkg.dev" || {
+  echo "DOCKER LOGIN FAILED" >&2
+  # print non-sensitive diagnostics
+  echo "Contents of /root/.docker/config.json:" >&2
+  sudo cat /root/.docker/config.json 2>/dev/null || true
+  echo "Contents of /home/${VM_USER}/.docker/config.json:" >&2
+  cat /home/${VM_USER}/.docker/config.json 2>/dev/null || true
+  exit 2
+}
+
 # pull & restart
-docker pull "${IMAGE}"
+docker pull "\${IMAGE}"
 docker rm -f python-backend || true
-docker run -d --name python-backend -p 8000:8000 --restart unless-stopped "${IMAGE}"
+docker run -d --name python-backend -p 8000:8000 --restart unless-stopped "\${IMAGE}"
 EOF
