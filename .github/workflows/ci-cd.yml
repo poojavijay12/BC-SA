@@ -1,88 +1,71 @@
-name: CI/CD — Build & Deploy to GCE VM (validated)
+name: CI/CD
 
 on:
   push:
-    branches:
-      - main
+    branches: [ main ]
 
 permissions:
-  id-token: write
+  id-token: write    # required for OIDC
   contents: read
-
-env:
-  GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
-  GCP_PROJECT_NUMBER: ${{ secrets.GCP_PROJECT_NUMBER }}
-  WIF_POOL: ${{ secrets.WIF_POOL }}
-  WIF_PROVIDER: ${{ secrets.WIF_PROVIDER }}
-  GCP_SA_EMAIL: ${{ secrets.GCP_SA_EMAIL }}
-  GCP_REGION: ${{ secrets.GCP_REGION }}
-  ARTIFACT_REPO: ${{ secrets.ARTIFACT_REPO }}
-  IMAGE_NAME: ${{ secrets.IMAGE_NAME }}
-  VM_IP: ${{ secrets.VM_EXTERNAL_IP }}
-  VM_USER: ${{ secrets.VM_USER }}   # must be set in repo secrets (e.g. "ubuntu")
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
+    environment: production
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+    - name: Checkout
+      uses: actions/checkout@v4
 
-      - name: DEBUG: show provider (safe)
-        run: |
-          echo "GCP_PROJECT_NUMBER='${{ secrets.GCP_PROJECT_NUMBER }}'"
-          echo "WIF_POOL='${{ secrets.WIF_POOL }}'"
-          echo "WIF_PROVIDER='${{ secrets.WIF_PROVIDER }}'"
-          echo "Resolved provider:"
-          echo "projects/${{ secrets.GCP_PROJECT_NUMBER }}/locations/global/workloadIdentityPools/${{ secrets.WIF_POOL }}/providers/${{ secrets.WIF_PROVIDER }}"
-          echo "Service account: ${{ secrets.GCP_SA_EMAIL }}"
+    # Authenticate to GCP via Workload Identity Federation
+    - name: Authenticate to Google Cloud
+      uses: 'google-github-actions/auth@v1'
+      with:
+        workload_identity_provider: "projects/${{ secrets.GCP_PROJECT_NUMBER }}/locations/global/workloadIdentityPools/${{ secrets.WIF_POOL }}/providers/${{ secrets.WIF_PROVIDER }}"
+        service_account: "${{ secrets.GCP_SA_EMAIL }}"
 
-      - name: Authenticate to Google Cloud (WIF)
-        uses: google-github-actions/auth@v1
-        with:
-          workload_identity_provider: "projects/${{ secrets.GCP_PROJECT_NUMBER }}/locations/global/workloadIdentityPools/${{ secrets.WIF_POOL }}/providers/${{ secrets.WIF_PROVIDER }}"
-          service_account: "${{ secrets.GCP_SA_EMAIL }}"
+    - name: Setup gcloud CLI
+      uses: 'google-github-actions/setup-gcloud@v3'
+      with:
+        version: '>= 363.0.0'
+        project_id: ${{ secrets.GCP_PROJECT_ID }}
 
-      - name: Setup gcloud
-        uses: google-github-actions/setup-gcloud@v3
-        with:
-          project_id: ${{ secrets.GCP_PROJECT_ID }}
-          version: "latest"
+    - name: Get secrets from Secret Manager
+      id: get-secrets
+      uses: 'google-github-actions/get-secretmanager-secrets@v0'
+      with:
+        secrets: |
+          github-actions-ssh-key:SSH_KEY
+          db-password:DB_PASSWORD
+          # add other secrets as needed
+      # outputs are available as steps.get-secrets.outputs.SSH_KEY etc. (Base64)
+      
+    - name: Decode SSH key to file
+      run: |
+        echo "${{ steps.get-secrets.outputs.SSH_KEY }}" | base64 --decode > ./deploy_key
+        chmod 600 ./deploy_key
 
-      - name: Fetch SSH key from Secret Manager
-        id: get-ssh
-        uses: google-github-actions/get-secretmanager-secrets@v0
-        with:
-          secrets: |
-            github-actions-ssh-key:SSH_KEY
+    - name: Build Docker image
+      run: |
+        IMAGE="${{ secrets.GCP_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ secrets.ARTIFACT_REPO }}/${{ secrets.IMAGE_NAME }}:${GITHUB_SHA::8}"
+        docker build -t "$IMAGE" .
+        # Configure docker to use Artifact Registry via gcloud
+        gcloud auth configure-docker "${{ secrets.GCP_REGION }}-docker.pkg.dev" --quiet
+        docker push "$IMAGE"
+      env:
+        GCP_REGION: ${{ secrets.GCP_REGION }}
+        GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+        ARTIFACT_REPO: ${{ secrets.ARTIFACT_REPO }}
+        IMAGE_NAME: ${{ secrets.IMAGE_NAME }}
 
-      - name: Write SSH key to file
-        run: |
-          echo "${{ steps.get-ssh.outputs.SSH_KEY }}" | base64 --decode > ./deploy_key
-          chmod 600 ./deploy_key
-
-      - name: Build & push image
-        run: |
-          set -euo pipefail
-          IMAGE="${{ secrets.GCP_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ secrets.ARTIFACT_REPO }}/${{ secrets.IMAGE_NAME }}:${GITHUB_SHA::8}"
-          echo "IMAGE=${IMAGE}" >> $GITHUB_ENV
-          docker build -t "${IMAGE}" .
-          gcloud auth configure-docker "${{ secrets.GCP_REGION }}-docker.pkg.dev" --quiet
-          docker push "${IMAGE}"
-
-      - name: Deploy to VM
-        run: |
-          set -euo pipefail
-          echo "Deploying ${IMAGE} to ${VM_USER}@${VM_IP}"
-          ssh -o StrictHostKeyChecking=no -i ./deploy_key ${VM_USER}@${VM_IP} <<'SSH_CMDS'
-            set -euxo pipefail
-            docker rm -f python-backend || true
-            docker pull "${IMAGE}"
-            docker run -d --name python-backend -p 8000:8000 --restart unless-stopped "${IMAGE}"
-            docker ps --filter "name=python-backend"
-          SSH_CMDS
-
-      - name: Show logs
-        run: |
-          ssh -o StrictHostKeyChecking=no -i ./deploy_key ${VM_USER}@${VM_IP} "docker logs --tail 50 python-backend || true"
+    - name: Deploy to VM via SSH (pull & restart)
+      run: |
+        IMAGE="${{ secrets.GCP_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ secrets.ARTIFACT_REPO }}/${{ secrets.IMAGE_NAME }}:${GITHUB_SHA::8}"
+        # copy a deploy helper to the VM and run it (alternatively run commands inline)
+        scp -o StrictHostKeyChecking=no -i ./deploy_key ./deploy/scripts/restart_container.sh ubuntu@${{ secrets.VM_EXTERNAL_IP }}:/tmp/restart_container.sh
+        ssh -o StrictHostKeyChecking=no -i ./deploy_key ubuntu@${{ secrets.VM_EXTERNAL_IP }} "bash /tmp/restart_container.sh $IMAGE ${{ secrets.DB_PASSWORD }}"
+      env:
+        GCP_REGION: ${{ secrets.GCP_REGION }}
+        GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+        ARTIFACT_REPO: ${{ secrets.ARTIFACT_REPO }}
+        IMAGE_NAME: ${{ secrets.IMAGE_NAME }}
