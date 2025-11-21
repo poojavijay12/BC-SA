@@ -1,19 +1,16 @@
 # .github/workflows/ci-cd.yml
 name: CI/CD — Build & Deploy to GCE VM
 
-# Run this on pushes to main (adjust as needed)
 on:
   push:
     branches:
       - main
 
-# Required so the runner can mint an ID token for Workload Identity
 permissions:
   id-token: write
   contents: read
 
 env:
-  # these values come from repository secrets (set these in your repo)
   GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
   GCP_PROJECT_NUMBER: ${{ secrets.GCP_PROJECT_NUMBER }}
   WIF_POOL: ${{ secrets.WIF_POOL }}
@@ -28,19 +25,15 @@ env:
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
-    # fail fast — stop on first failure
-    steps:
 
+    steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Authenticate to GCP via Workload Identity Federation (keyless)
       - name: Authenticate to Google Cloud (Workload Identity)
-        id: 'auth'
+        id: auth
         uses: google-github-actions/auth@v1
         with:
-          # MUST be the full resource name that expands to:
-          # projects/<NUMERIC_PROJECT_NUMBER>/locations/global/workloadIdentityPools/<POOL>/providers/<PROVIDER>
           workload_identity_provider: "projects/${{ env.GCP_PROJECT_NUMBER }}/locations/global/workloadIdentityPools/${{ env.WIF_POOL }}/providers/${{ env.WIF_PROVIDER }}"
           service_account: "${{ env.GCP_SA_EMAIL }}"
 
@@ -50,12 +43,10 @@ jobs:
           project_id: ${{ env.GCP_PROJECT_ID }}
           version: "latest"
 
-      # Fetch the SSH private key from GCP Secret Manager (keeps secret out of GitHub)
       - name: Fetch SSH key from Secret Manager
         id: get-ssh
         uses: google-github-actions/get-secretmanager-secrets@v0
         with:
-          # <secret-name-in-secret-manager>:<output-variable-name>
           secrets: |
             github-actions-ssh-key:SSH_KEY
 
@@ -64,7 +55,6 @@ jobs:
           echo "${{ steps.get-ssh.outputs.SSH_KEY }}" | base64 --decode > ./deploy_key
           chmod 600 ./deploy_key
 
-      # Build Docker image and push to Artifact Registry
       - name: Build & push Docker image to Artifact Registry
         id: build_push
         env:
@@ -74,58 +64,42 @@ jobs:
           IMAGE_NAME: ${{ env.IMAGE_NAME }}
         run: |
           set -euo pipefail
-          # tag with short SHA
           IMAGE="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${ARTIFACT_REPO}/${IMAGE_NAME}:${GITHUB_SHA::8}"
           echo "IMAGE=${IMAGE}" >> $GITHUB_ENV
-
           docker build -t "${IMAGE}" .
-          # configure docker to authenticate to Artifact Registry using gcloud credentials
           gcloud auth configure-docker "${GCP_REGION}-docker.pkg.dev" --quiet
           docker push "${IMAGE}"
 
-      # Deploy to VM via SSH (inline commands) — no external .sh file
       - name: Deploy to VM (pull image & restart container)
         env:
-          IMAGE: ${{ env.IMAGE_NAME }} # placeholder; overwritten via $GITHUB_ENV
+          # IMAGE is set in the previous step via $GITHUB_ENV
+          IMAGE: ${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT_ID }}/${{ env.ARTIFACT_REPO }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
           VM_IP: ${{ env.VM_IP }}
           VM_USER: ${{ env.VM_USER }}
         run: |
           set -euo pipefail
-          # IMAGE value is set in previous step in $GITHUB_ENV
-          echo "Deploying image: $IMAGE"
-          # Wait a short moment to ensure image is available in registry
+          echo "Deploying image: $IMAGE to ${VM_IP}"
+
+          # small pause to let registry reflect the image
           sleep 2
 
-          # Pull the image and replace running container
           ssh -o StrictHostKeyChecking=no -i ./deploy_key ${VM_USER}@${VM_IP} <<'SSH_CMDS'
           set -euxo pipefail
 
-          # ensure docker is present (startup script should have installed it)
           if ! command -v docker >/dev/null 2>&1; then
             echo "Docker not found — exiting"
             exit 1
           fi
 
-          # the remote environment will receive the IMAGE env value from the client side
-          IMAGE_TO_RUN="${IMAGE}"
-
-          # stop and remove old container if present
+          # remove existing container if any
           docker rm -f python-backend || true
 
-          # pull latest image
-          docker pull "${IMAGE_TO_RUN}"
-
-          # run container (adjust port mapping or env as required)
+          # pull and run the image passed from the client side
+          docker pull "${IMAGE}"
           docker run -d --name python-backend \
             -p 8000:8000 \
             --restart unless-stopped \
-            "${IMAGE_TO_RUN}"
+            "${IMAGE}"
 
-          # confirm it's running
           docker ps --filter "name=python-backend"
           SSH_CMDS
-        # pass IMAGE environment explicitly from $GITHUB_ENV into the ssh command
-        shell: bash
-        # ensure IMAGE is available in this step's environment (read from GITHUB_ENV)
-        env:
-          IMAGE: ${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT_ID }}/${{ env.ARTIFACT_REPO }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
