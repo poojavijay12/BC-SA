@@ -34,26 +34,21 @@ jobs:
     - name: Fetch SSH key from Secret Manager (via gcloud)
       id: get-ssh
       run: |
-        # Clean up any previous files
         rm -f ./deploy_key ./deploy_key.b64
 
-        # Fetch raw secret (should be base64-encoded private key)
         echo "Fetching SSH key from Secret Manager..."
         gcloud secrets versions access latest --secret="github-actions-ssh-key" --project="${{ secrets.GCP_PROJECT_ID }}" \
           | tr -d '\r' > ./deploy_key.b64
 
-        # Fail quickly if secret is empty
         if [ ! -s ./deploy_key.b64 ]; then
           echo "ERROR: fetched secret is empty" >&2
           ls -l ./deploy_key.b64 || true
           exit 1
         fi
 
-        # Decode into actual private key file
         base64 --decode ./deploy_key.b64 > ./deploy_key
         chmod 600 ./deploy_key
 
-        # Debug (non-secret): show size and header line
         echo "deploy_key size (bytes): $(wc -c < ./deploy_key)"
         head -n 1 ./deploy_key | sed -n '1p'
 
@@ -67,17 +62,16 @@ jobs:
         IMAGE="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${ARTIFACT_REPO}/${IMAGE_NAME}:${GITHUB_SHA::8}"
         echo "Building image: $IMAGE"
         docker build -t "$IMAGE" .
-        # authenticate docker to Artifact Registry using gcloud credentials file created by auth action
         gcloud auth configure-docker "${GCP_REGION}-docker.pkg.dev" --quiet
         docker push "$IMAGE"
         echo "IMAGE=$IMAGE" >> $GITHUB_ENV
 
-    - name: Deploy to VM (inline commands, safer)
+    - name: Deploy to VM (inline commands, safer + known_hosts)
       env:
         VM_IP: ${{ secrets.VM_EXTERNAL_IP }}
         VM_USER: ${{ secrets.VM_USER }}
       run: |
-        # Verify inputs
+        # Validate inputs
         if [ -z "${VM_IP:-}" ]; then
           echo "ERROR: VM_EXTERNAL_IP is empty. Add secret VM_EXTERNAL_IP to the repo." >&2
           exit 1
@@ -92,16 +86,26 @@ jobs:
           exit 1
         fi
 
-        # Non-sensitive debug
         echo "Deploying image: ${IMAGE:-<missing IMAGE var>} to ${VM_IP} as ${VM_USER}"
         echo "deploy_key size (bytes): $(wc -c < ./deploy_key)"
 
-        # quick ssh test (short timeout)
+        # Prepare known_hosts using ssh-keyscan (avoids Host key verification failure)
+        mkdir -p ~/.ssh
+        chmod 700 ~/.ssh
+
+        echo "Fetching host key for ${VM_IP}..."
+        ssh-keyscan -T 10 "${VM_IP}" 2>/dev/null | tee -a ~/.ssh/known_hosts >/dev/null || true
+        chmod 644 ~/.ssh/known_hosts
+        echo "Known hosts entries: $(wc -l ~/.ssh/known_hosts || true)"
+
+        # Quick ssh test (BatchMode prevents prompt)
         ssh -o BatchMode=yes -o ConnectTimeout=10 -i ./deploy_key "${VM_USER}@${VM_IP}" "echo SSH_OK" || {
           echo "ERROR: SSH test failed. Check that deploy_key is valid, public key is on VM, VM_USER/VM_IP are correct, and firewall allows port 22." >&2
+          echo "deploy_key size (bytes): $(wc -c < ./deploy_key || true)"
+          echo "known_hosts entries: $(wc -l ~/.ssh/known_hosts || true)"
           exit 1
         }
 
-        # actual deploy - pull image, stop old container, run new one
+        # Actual deploy
         ssh -o StrictHostKeyChecking=no -i ./deploy_key "${VM_USER}@${VM_IP}" \
           "docker pull ${IMAGE} && docker rm -f python-backend || true && docker run -d --name python-backend -p 8000:8000 --restart unless-stopped ${IMAGE}"
