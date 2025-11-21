@@ -66,46 +66,40 @@ jobs:
         docker push "$IMAGE"
         echo "IMAGE=$IMAGE" >> $GITHUB_ENV
 
-    - name: Deploy to VM (inline commands, safer + known_hosts)
+    - name: Deploy to VM (login with short-lived token & deploy)
       env:
         VM_IP: ${{ secrets.VM_EXTERNAL_IP }}
         VM_USER: ${{ secrets.VM_USER }}
+        GCP_REGION: ${{ secrets.GCP_REGION }}
       run: |
-        # Validate inputs
-        if [ -z "${VM_IP:-}" ]; then
-          echo "ERROR: VM_EXTERNAL_IP is empty. Add secret VM_EXTERNAL_IP to the repo." >&2
-          exit 1
-        fi
-        if [ -z "${VM_USER:-}" ]; then
-          echo "ERROR: VM_USER is empty. Add secret VM_USER to the repo." >&2
-          exit 1
-        fi
-        if [ ! -s ./deploy_key ]; then
-          echo "ERROR: deploy_key file missing or empty. Check Secret Manager step wrote ./deploy_key" >&2
-          ls -l ./deploy_key || true
+        if [ -z "${VM_IP:-}" ] || [ -z "${VM_USER:-}" ]; then
+          echo "ERROR: VM_EXTERNAL_IP or VM_USER is empty" >&2
           exit 1
         fi
 
         echo "Deploying image: ${IMAGE:-<missing IMAGE var>} to ${VM_IP} as ${VM_USER}"
-        echo "deploy_key size (bytes): $(wc -c < ./deploy_key)"
 
-        # Prepare known_hosts using ssh-keyscan (avoids Host key verification failure)
-        mkdir -p ~/.ssh
-        chmod 700 ~/.ssh
-
-        echo "Fetching host key for ${VM_IP}..."
-        ssh-keyscan -T 10 "${VM_IP}" 2>/dev/null | tee -a ~/.ssh/known_hosts >/dev/null || true
-        chmod 644 ~/.ssh/known_hosts
-        echo "Known hosts entries: $(wc -l ~/.ssh/known_hosts || true)"
-
-        # Quick ssh test (BatchMode prevents prompt)
-        ssh -o BatchMode=yes -o ConnectTimeout=10 -i ./deploy_key "${VM_USER}@${VM_IP}" "echo SSH_OK" || {
-          echo "ERROR: SSH test failed. Check that deploy_key is valid, public key is on VM, VM_USER/VM_IP are correct, and firewall allows port 22." >&2
-          echo "deploy_key size (bytes): $(wc -c < ./deploy_key || true)"
-          echo "known_hosts entries: $(wc -l ~/.ssh/known_hosts || true)"
+        # get short-lived access token on the runner
+        ACCESS_TOKEN="$(gcloud auth print-access-token)"
+        if [ -z "$ACCESS_TOKEN" ]; then
+          echo "ERROR: failed to get access token" >&2
           exit 1
-        }
+        fi
 
-        # Actual deploy
-        ssh -o StrictHostKeyChecking=no -i ./deploy_key "${VM_USER}@${VM_IP}" \
-          "docker pull ${IMAGE} && docker rm -f python-backend || true && docker run -d --name python-backend -p 8000:8000 --restart unless-stopped ${IMAGE}"
+        # ensure known host present
+        mkdir -p ~/.ssh; chmod 700 ~/.ssh
+        ssh-keyscan -T 10 "${VM_IP}" 2>/dev/null | tee -a ~/.ssh/known_hosts >/dev/null || true
+
+        # run docker login on the VM and deploy the image
+        ssh -o StrictHostKeyChecking=no -i ./deploy_key "${VM_USER}@${VM_IP}" /bin/bash -s <<'EOF'
+set -euo pipefail
+ACCESS_TOKEN_FROM_RUNNER='$ACCESS_TOKEN'
+REGION='${{ secrets.GCP_REGION }}'
+IMAGE='${IMAGE}'
+# login to Artifact Registry on the VM using token
+printf '%s' "${ACCESS_TOKEN_FROM_RUNNER}" | docker login -u oauth2accesstoken --password-stdin "https://${REGION}-docker.pkg.dev"
+# pull & restart
+docker pull "${IMAGE}"
+docker rm -f python-backend || true
+docker run -d --name python-backend -p 8000:8000 --restart unless-stopped "${IMAGE}"
+EOF
