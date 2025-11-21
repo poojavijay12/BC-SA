@@ -1,71 +1,65 @@
-name: CI/CD
+name: CI/CD - build & deploy to GCE VM
 
 on:
   push:
     branches: [ main ]
 
 permissions:
-  id-token: write    # required for OIDC
+  id-token: write
   contents: read
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
-    environment: production
 
     steps:
-    - name: Checkout
+    - name: Checkout code
       uses: actions/checkout@v4
 
-    # Authenticate to GCP via Workload Identity Federation
-    - name: Authenticate to Google Cloud
-      uses: 'google-github-actions/auth@v1'
+    - name: Authenticate to Google Cloud (Workload Identity)
+      uses: google-github-actions/auth@v1
       with:
-        workload_identity_provider: "projects/${{ secrets.GCP_PROJECT_NUMBER }}/locations/global/workloadIdentityPools/${{ secrets.WIF_POOL }}/providers/${{ secrets.WIF_PROVIDER }}"
+        workload_identity_provider: "${{ secrets.WIF_PROVIDER_FULL }}"   # ENTIRE provider resource
         service_account: "${{ secrets.GCP_SA_EMAIL }}"
 
-    - name: Setup gcloud CLI
-      uses: 'google-github-actions/setup-gcloud@v3'
-      with:
-        version: '>= 363.0.0'
-        project_id: ${{ secrets.GCP_PROJECT_ID }}
 
-    - name: Get secrets from Secret Manager
-      id: get-secrets
-      uses: 'google-github-actions/get-secretmanager-secrets@v0'
+    - name: Setup gcloud CLI
+      uses: google-github-actions/setup-gcloud@v3
+      with:
+        project_id: ${{ secrets.GCP_PROJECT_ID }}
+        version: "latest"
+
+    - name: Fetch SSH key from Secret Manager
+      id: get-ssh
+      uses: google-github-actions/get-secretmanager-secrets@v0
       with:
         secrets: |
           github-actions-ssh-key:SSH_KEY
-          db-password:DB_PASSWORD
-          # add other secrets as needed
-      # outputs are available as steps.get-secrets.outputs.SSH_KEY etc. (Base64)
-      
-    - name: Decode SSH key to file
+
+    - name: Write SSH key to file
       run: |
-        echo "${{ steps.get-secrets.outputs.SSH_KEY }}" | base64 --decode > ./deploy_key
+        echo "${{ steps.get-ssh.outputs.SSH_KEY }}" | base64 --decode > ./deploy_key
         chmod 600 ./deploy_key
 
     - name: Build Docker image
+      env:
+        GCP_REGION: ${{ secrets.GCP_REGION }}
+        GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+        ARTIFACT_REPO: ${{ secrets.ARTIFACT_REPO }}
+        IMAGE_NAME: ${{ secrets.IMAGE_NAME }}
       run: |
-        IMAGE="${{ secrets.GCP_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ secrets.ARTIFACT_REPO }}/${{ secrets.IMAGE_NAME }}:${GITHUB_SHA::8}"
+        IMAGE="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${ARTIFACT_REPO}/${IMAGE_NAME}:${GITHUB_SHA::8}"
         docker build -t "$IMAGE" .
-        # Configure docker to use Artifact Registry via gcloud
-        gcloud auth configure-docker "${{ secrets.GCP_REGION }}-docker.pkg.dev" --quiet
+        gcloud auth configure-docker "${GCP_REGION}-docker.pkg.dev" --quiet
         docker push "$IMAGE"
-      env:
-        GCP_REGION: ${{ secrets.GCP_REGION }}
-        GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
-        ARTIFACT_REPO: ${{ secrets.ARTIFACT_REPO }}
-        IMAGE_NAME: ${{ secrets.IMAGE_NAME }}
+        echo "IMAGE=$IMAGE" >> $GITHUB_ENV
 
-    - name: Deploy to VM via SSH (pull & restart)
-      run: |
-        IMAGE="${{ secrets.GCP_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ secrets.ARTIFACT_REPO }}/${{ secrets.IMAGE_NAME }}:${GITHUB_SHA::8}"
-        # copy a deploy helper to the VM and run it (alternatively run commands inline)
-        scp -o StrictHostKeyChecking=no -i ./deploy_key ./deploy/scripts/restart_container.sh ubuntu@${{ secrets.VM_EXTERNAL_IP }}:/tmp/restart_container.sh
-        ssh -o StrictHostKeyChecking=no -i ./deploy_key ubuntu@${{ secrets.VM_EXTERNAL_IP }} "bash /tmp/restart_container.sh $IMAGE ${{ secrets.DB_PASSWORD }}"
+    - name: Deploy to VM (inline commands)
       env:
-        GCP_REGION: ${{ secrets.GCP_REGION }}
-        GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
-        ARTIFACT_REPO: ${{ secrets.ARTIFACT_REPO }}
-        IMAGE_NAME: ${{ secrets.IMAGE_NAME }}
+        VM_IP: ${{ secrets.VM_EXTERNAL_IP }}
+      run: |
+        IMAGE="$IMAGE"  # from previous step via $GITHUB_ENV
+        echo "Deploying image: $IMAGE to $VM_IP"
+        # copy nothing: we will run commands on the VM inline via ssh
+        ssh -o StrictHostKeyChecking=no -i ./deploy_key ${VM_USER}@${VM_IP} \
+          "docker pull ${IMAGE} && docker rm -f python-backend || true && docker run -d --name python-backend -p 8000:8000 --restart unless-stopped ${IMAGE}"
