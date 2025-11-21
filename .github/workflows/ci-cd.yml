@@ -19,16 +19,10 @@ jobs:
     - name: Authenticate to Google Cloud (Workload Identity)
       uses: google-github-actions/auth@v3
       with:
-        # GitHub secret containing the full provider resource path:
-        # projects/260643119019/locations/global/workloadIdentityPools/gha-pool-1763714946/providers/gha-prov-1763715055
         workload_identity_provider: "${{ secrets.WIF_PROVIDER_FULL }}"
-        # GitHub secret containing the service account email (no JSON key)
         service_account: "${{ secrets.GCP_SA_EMAIL }}"
-        # Create a credentials file so `gcloud` can use stable credentials
         create_credentials_file: true
-        # Export common environment variables (CLOUDSDK_PROJECT, etc.)
         export_environment_variables: true
-        # Explicitly set the project id to avoid gcloud trying to refresh tokens itself
         project_id: ${{ secrets.GCP_PROJECT_ID }}
 
     - name: Setup gcloud CLI
